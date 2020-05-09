@@ -1,6 +1,10 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 
+// for threading
+#include <Windows.h>
+#include <process.h>
+
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -17,73 +21,139 @@
 using namespace std;
 using namespace nlohmann;
 
-bool predict_joints(json &frames_json, int frame_count, k4abt_tracker_t tracker, k4a_capture_t capture_handle)
+// global
+int frame_count = 0;
+json frames_json = json::array();
+
+bool doneGenerating;
+
+//declare
+bool check_depth_image_exists(k4a_capture_t capture);
+
+typedef struct
 {
-    k4a_wait_result_t queue_capture_result = k4abt_tracker_enqueue_capture(tracker, capture_handle, K4A_WAIT_INFINITE);
-    if (queue_capture_result != K4A_WAIT_RESULT_SUCCEEDED)
+    k4a_playback_t playback_handle;
+    k4abt_tracker_t tracker;
+} ThreadArgs;
+
+unsigned __stdcall generate_body_frame(void* args)
+{
+    ThreadArgs* threadArgs = (ThreadArgs*)args;
+    k4a_playback_t playback_handle = threadArgs->playback_handle;
+    k4abt_tracker_t tracker = threadArgs->tracker;
+
+    bool success = true;
+    while (true)
     {
-        cerr << "Error! Adding capture to tracker process queue failed!" << endl;
-        return false;
-    }
+        k4a_capture_t capture_handle = nullptr;
+        k4a_stream_result_t stream_result = k4a_playback_get_next_capture(playback_handle, &capture_handle);
 
-    k4abt_frame_t body_frame = nullptr;
-    k4a_wait_result_t pop_frame_result = k4abt_tracker_pop_result(tracker, &body_frame, K4A_WAIT_INFINITE);
-    if (pop_frame_result != K4A_WAIT_RESULT_SUCCEEDED)
-    {
-        cerr << "Error! Popping body tracking result failed!" << endl;
-        return false;
-    }
+        cerr << "k4a_playback_get_next_capture completed frame " << frame_count << "\n";
 
-    uint32_t num_bodies = k4abt_frame_get_num_bodies(body_frame);
-    uint64_t timestamp = k4abt_frame_get_device_timestamp_usec(body_frame);
-
-    json frame_result_json;
-    frame_result_json["timestamp_usec"] = timestamp;
-    frame_result_json["frame_id"] = frame_count;
-    frame_result_json["num_bodies"] = num_bodies;
-    frame_result_json["bodies"] = json::array();
-    for (uint32_t i = 0; i < num_bodies; i++)
-    {
-        k4abt_skeleton_t skeleton;
-        VERIFY(k4abt_frame_get_body_skeleton(body_frame, i, &skeleton), "Get body from body frame failed!");
-        json body_result_json;
-        int body_id = k4abt_frame_get_body_id(body_frame, i);
-        body_result_json["body_id"] = body_id;
-
-        for (int j = 0; j < (int)K4ABT_JOINT_COUNT; j++)
+        if (stream_result == K4A_STREAM_RESULT_EOF)
         {
-            body_result_json["joint_positions"].push_back( {    skeleton.joints[j].position.xyz.x,
-                                                                skeleton.joints[j].position.xyz.y,
-                                                                skeleton.joints[j].position.xyz.z });
-
-            body_result_json["joint_orientations"].push_back({  skeleton.joints[j].orientation.wxyz.w,
-                                                                skeleton.joints[j].orientation.wxyz.x,
-                                                                skeleton.joints[j].orientation.wxyz.y,
-                                                                skeleton.joints[j].orientation.wxyz.z });
+            doneGenerating = true;
+            break;
         }
-        frame_result_json["bodies"].push_back(body_result_json);
-    }
-    frames_json.push_back(frame_result_json);
-    k4abt_frame_release(body_frame);
 
-    return true;
+        if (stream_result == K4A_STREAM_RESULT_SUCCEEDED)
+        {
+            // Only try to predict joints when capture contains depth image
+            if (check_depth_image_exists(capture_handle))
+            {
+                k4a_wait_result_t queue_capture_result = k4abt_tracker_enqueue_capture(tracker, capture_handle, K4A_WAIT_INFINITE);
+                if (queue_capture_result != K4A_WAIT_RESULT_SUCCEEDED)
+                {
+                    cerr << "Error! Adding capture to tracker process queue failed!" << endl;
+                    doneGenerating = true;
+                    break;
+                }
+
+                //success = success && pop_and_predict_joints(frames_json, frame_count, tracker);
+                k4a_capture_release(capture_handle);
+                if (!success)
+                {
+                    cerr << "Predict joints failed for clip at frame " << frame_count << endl;
+                    doneGenerating = true;
+                    break;
+                }
+            }
+        }
+        else
+        {
+            success = false;
+            cerr << "Stream error for clip at frame " << frame_count << endl;
+            doneGenerating = true;
+            break;
+        }
+
+        frame_count++;
+    }
+
+    return 0;
 }
 
-bool check_depth_image_exists(k4a_capture_t capture)
+unsigned __stdcall process_body_frame(void* args)
 {
-    k4a_image_t depth = k4a_capture_get_depth_image(capture);
-    if (depth != nullptr)
+    ThreadArgs* threadArgs = (ThreadArgs*)args;
+    k4abt_tracker_t tracker = threadArgs->tracker;
+
+    int32_t POP_TIMEOUT_MS = 1000;
+    k4abt_frame_t body_frame = nullptr;
+
+    while (doneGenerating == false)
     {
-        k4a_image_release(depth);
-        return true;
+
+        k4a_wait_result_t pop_frame_result = k4abt_tracker_pop_result(tracker, &body_frame, POP_TIMEOUT_MS);
+
+        if ((pop_frame_result == K4A_WAIT_RESULT_TIMEOUT) && (doneGenerating == true))
+        {
+            break;
+        }
+
+        if (pop_frame_result != K4A_WAIT_RESULT_SUCCEEDED)
+        {
+            cerr << "Error! Popping body tracking result failed!" << endl;
+            break;
+        }
+
+        uint32_t num_bodies = k4abt_frame_get_num_bodies(body_frame);
+        uint64_t timestamp = k4abt_frame_get_device_timestamp_usec(body_frame);
+
+        json frame_result_json;
+        frame_result_json["timestamp_usec"] = timestamp;
+        frame_result_json["frame_id"] = frame_count;
+        frame_result_json["num_bodies"] = num_bodies;
+        frame_result_json["bodies"] = json::array();
+        for (uint32_t i = 0; i < num_bodies; i++)
+        {
+            k4abt_skeleton_t skeleton;
+            VERIFY(k4abt_frame_get_body_skeleton(body_frame, i, &skeleton), "Get body from body frame failed!");
+            json body_result_json;
+            int body_id = k4abt_frame_get_body_id(body_frame, i);
+            body_result_json["body_id"] = body_id;
+
+            for (int j = 0; j < (int)K4ABT_JOINT_COUNT; j++)
+            {
+                body_result_json["joint_positions"].push_back({ skeleton.joints[j].position.xyz.x,
+                                                                    skeleton.joints[j].position.xyz.y,
+                                                                    skeleton.joints[j].position.xyz.z });
+
+                body_result_json["joint_orientations"].push_back({ skeleton.joints[j].orientation.wxyz.w,
+                                                                    skeleton.joints[j].orientation.wxyz.x,
+                                                                    skeleton.joints[j].orientation.wxyz.y,
+                                                                    skeleton.joints[j].orientation.wxyz.z });
+            }
+            frame_result_json["bodies"].push_back(body_result_json);
+        }
+        frames_json.push_back(frame_result_json);
+        k4abt_frame_release(body_frame);
     }
-    else
-    {
-        return false;
-    }
+
+    return 0;
 }
 
-bool process_mkv_offline(const char* input_path, const char* output_path)
+bool process_mkv(const char* input_path, const char* output_path)
 {
     k4a_playback_t playback_handle = nullptr;
     k4a_result_t result = k4a_playback_open(input_path, &playback_handle);
@@ -140,44 +210,34 @@ bool process_mkv_offline(const char* input_path, const char* output_path)
 
     cout << "Tracking " << input_path << endl;
 
-    int frame_count = 0;
-    json frames_json = json::array();
+    HANDLE threadGen;
+    unsigned threadGenId;
+
+    HANDLE threadProc;
+    unsigned threadProcId;
+
+    ThreadArgs* threadGenArgs = new ThreadArgs();
+    threadGenArgs->playback_handle = playback_handle;
+    threadGenArgs->tracker = tracker;
+
+    ThreadArgs* threadProcArgs = new ThreadArgs();
+    threadProcArgs->tracker = tracker;
+
+    doneGenerating = false;
+
+    cout << "starting generation thread...\n";
+    threadGen  = (HANDLE)_beginthreadex(NULL, 0, &generate_body_frame, threadGenArgs, 0, &threadGenId);
+
+    cout << "stsrting processing thread...\n";
+    threadProc = (HANDLE)_beginthreadex(NULL, 0, &process_body_frame, threadProcArgs, 0, &threadProcId);
+     
+    WaitForSingleObject(threadGen, INFINITE);
+    WaitForSingleObject(threadProc, INFINITE);
+
+    //generate_body_frame(playback_handle, tracker);
+    //process_body_frame(tracker);
+
     bool success = true;
-    while (true)
-    {
-        k4a_capture_t capture_handle = nullptr;
-        k4a_stream_result_t stream_result = k4a_playback_get_next_capture(playback_handle, &capture_handle);
-
-        cerr << "k4a_playback_get_next_capture completed frame " << frame_count << "\n";
-
-        if (stream_result == K4A_STREAM_RESULT_EOF)
-        {
-            break;
-        }
-
-        if (stream_result == K4A_STREAM_RESULT_SUCCEEDED)
-        {
-            // Only try to predict joints when capture contains depth image
-            if (check_depth_image_exists(capture_handle))
-            {
-                success = predict_joints(frames_json, frame_count, tracker, capture_handle);
-                k4a_capture_release(capture_handle);
-                if (!success)
-                {
-                    cerr << "Predict joints failed for clip at frame " << frame_count << endl;
-                    break;
-                }
-            }
-        }
-        else
-        {
-            success = false;
-            cerr << "Stream error for clip at frame " << frame_count << endl;
-            break;
-        }
-
-        frame_count++;
-    }
 
     if (success)
     {
@@ -195,6 +255,20 @@ bool process_mkv_offline(const char* input_path, const char* output_path)
     return success;
 }
 
+bool check_depth_image_exists(k4a_capture_t capture)
+{
+    k4a_image_t depth = k4a_capture_get_depth_image(capture);
+    if (depth != nullptr)
+    {
+        k4a_image_release(depth);
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc != 3)
@@ -203,5 +277,5 @@ int main(int argc, char **argv)
         return -1;
     }
 
-    return process_mkv_offline(argv[1], argv[2]) ? 0 : -1;
+    return process_mkv(argv[1], argv[2]) ? 0 : -1;
 }
