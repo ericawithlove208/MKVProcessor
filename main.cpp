@@ -2,8 +2,12 @@
 // Licensed under the MIT License.
 
 // for threading
+#ifdef __linux__
+#include <pthread.h>
+#else
 #include <Windows.h>
 #include <process.h>
+#endif
 
 #include <iostream>
 #include <fstream>
@@ -36,7 +40,11 @@ typedef struct
     k4abt_tracker_t tracker;
 } ThreadArgs;
 
+#ifdef __linux__
+void* generate_body_frame(void* args)
+#else
 unsigned __stdcall generate_body_frame(void* args)
+#endif
 {
     ThreadArgs* threadArgs = (ThreadArgs*)args;
     k4a_playback_t playback_handle = threadArgs->playback_handle;
@@ -93,7 +101,11 @@ unsigned __stdcall generate_body_frame(void* args)
     return 0;
 }
 
+#ifdef __linux__
+void* process_body_frame(void* args)
+#else
 unsigned __stdcall process_body_frame(void* args)
+#endif
 {
     ThreadArgs* threadArgs = (ThreadArgs*)args;
     k4abt_tracker_t tracker = threadArgs->tracker;
@@ -210,12 +222,6 @@ bool process_mkv(const char* input_path, const char* output_path)
 
     cout << "Tracking " << input_path << endl;
 
-    HANDLE threadGen;
-    unsigned threadGenId;
-
-    HANDLE threadProc;
-    unsigned threadProcId;
-
     ThreadArgs* threadGenArgs = new ThreadArgs();
     threadGenArgs->playback_handle = playback_handle;
     threadGenArgs->tracker = tracker;
@@ -225,6 +231,26 @@ bool process_mkv(const char* input_path, const char* output_path)
 
     doneGenerating = false;
 
+    #ifdef __linux__
+    pthread_t threadGen;
+    pthread_t threadProc;
+
+    cout << "starting generation thread...\n";
+    pthread_create(&threadGen, NULL, generate_body_frame, threadGenArgs);
+    
+    cout << "stsrting processing thread...\n";
+    pthread_create(&threadGen, NULL, process_body_frame, threadProcArgs);
+
+    pthread_join(threadGen, NULL);
+    pthread_join(threadProc, NULL);
+    
+    #else
+    HANDLE threadGen;
+    unsigned threadGenId;
+
+    HANDLE threadProc;
+    unsigned threadProcId;
+   
     cout << "starting generation thread...\n";
     threadGen  = (HANDLE)_beginthreadex(NULL, 0, &generate_body_frame, threadGenArgs, 0, &threadGenId);
 
@@ -233,6 +259,7 @@ bool process_mkv(const char* input_path, const char* output_path)
      
     WaitForSingleObject(threadGen, INFINITE);
     WaitForSingleObject(threadProc, INFINITE);
+    #endif
 
     //generate_body_frame(playback_handle, tracker);
     //process_body_frame(tracker);
