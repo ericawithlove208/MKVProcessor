@@ -98,7 +98,13 @@ unsigned __stdcall generate_body_frame(void* args)
         frame_count++;
     }
 
+    cerr << "thread gen exiting\n";
+
+    #ifdef __linux__
+    pthread_exit(NULL);
+    #else
     return 0;
+    #endif
 }
 
 #ifdef __linux__
@@ -162,7 +168,13 @@ unsigned __stdcall process_body_frame(void* args)
         k4abt_frame_release(body_frame);
     }
 
+    cerr << "thread proc exiting\n";
+   
+    #ifdef __linux__
+    pthread_exit(NULL);
+    #else
     return 0;
+    #endif
 }
 
 bool process_mkv(const char* input_path, const char* output_path)
@@ -236,14 +248,35 @@ bool process_mkv(const char* input_path, const char* output_path)
     pthread_t threadProc;
 
     cout << "starting generation thread...\n";
-    pthread_create(&threadGen, NULL, generate_body_frame, threadGenArgs);
+    int ret = pthread_create(&threadGen, NULL, &generate_body_frame, threadGenArgs);
+    if (ret != 0)
+    {
+        cerr << "Error from pthread create gen " << ret;
+	exit(1);
+    }
     
     cout << "stsrting processing thread...\n";
-    pthread_create(&threadGen, NULL, process_body_frame, threadProcArgs);
+    ret = pthread_create(&threadProc, NULL, &process_body_frame, threadProcArgs);
+    if (ret != 0)
+    {
+        cerr << "Error from pthread create proc " << ret;
+	exit(1);
+    }
 
-    pthread_join(threadGen, NULL);
-    pthread_join(threadProc, NULL);
-    
+    ret = pthread_join(threadGen, NULL);
+    if (ret != 0)
+    {
+        cerr << "Error from pthread join gen " << ret;
+	exit(1);
+    }
+
+    ret = pthread_join(threadProc, NULL);
+    if (ret != 0)
+    {
+        cerr << "Error from pthread join proc " << ret;
+	exit(1);
+    }
+
     #else
     HANDLE threadGen;
     unsigned threadGenId;
@@ -274,7 +307,7 @@ bool process_mkv(const char* input_path, const char* output_path)
         cout << "Total read " << frame_count << " frames" << endl;
         std::ofstream output_file(output_path);
         output_file << std::setw(4) << json_output << std::endl;
-        cout << "Results saved in " << output_path;
+        cout << "Results saved in " << output_path << endl;
     }
 
     k4a_playback_close(playback_handle);
